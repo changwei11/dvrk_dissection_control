@@ -108,7 +108,7 @@ class DissectionNode(Node):
             grid_query_frame=0,
             use_autocast=True,
             save_debug_plots=False,
-            pruner_threshold=2.0,
+            pruner_threshold=2.3,
         )
         self.reveal_trk = LiteTrackingModule(self.reveal_cfg)
         self._reveal_ready = False
@@ -128,6 +128,32 @@ class DissectionNode(Node):
         self._viz_every = 1   # draw every frame; make 2/3/etc. to throttle
         self._viz_counter = 0
 
+        self.reveal_mode = "roi"   # or "roi"
+
+        # keep both configurations so you can flip later by editing the line above
+        self.reveal_presets = {
+            "line_pairs": {
+                "n_pairs": 100,
+                "width_factor": 2.0,
+            },
+            "roi": {
+                "width_factor": 1.0,  # band thickness as a fraction of span
+                "n_keypoints": 225,   # grid density inside ROI
+                "k": 4,               # kNN edges per node
+                "deduplicate": True,
+            },
+        }
+
+        self.replay = True
+        self._replay_count = 0   # how many replays already done
+        self._replay_limit = 3   # how many times to replay PSM2
+
+
+        self.record_flag = True
+        self._data_root = "data/control_data"
+        self._episode_dir = None
+        self._recording = False
+        self._frame_idx = 0
 
     def _now_s(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -170,6 +196,14 @@ class DissectionNode(Node):
                     self._draw_live_overlay()
         except Exception as e:
             self.get_logger().warn(f"live overlay failed: {e}")
+
+        # Record this frame if recording is active
+        if self.record_flag:
+            try:
+                self._save_left_frame(bgr)
+            except Exception as e:
+                self.get_logger().warn(f"[REC] save frame failed: {e}")
+
 
     def callback_disp(self, msg: Image):
         self.disp = self._to_cv(msg)
@@ -229,6 +263,10 @@ class DissectionNode(Node):
                 self._tracking_active = True 
                 self.planner.start(self.target_1)
                 self._plan_started = True
+
+                #start recording
+                if self.record_flag:
+                    self._start_recording()
                 return
 
             st1 = self.planner.step()
@@ -279,7 +317,8 @@ class DissectionNode(Node):
                 tgt = self._cut_targets_base[self._cut_idx]
                 # choose a direction for this target
                 if hasattr(self, "_cut_dirs_base") and len(self._cut_dirs_base) > self._cut_idx:
-                    dir_y = self._cut_dirs_base[self._cut_idx]
+                    # dir_y = self._cut_dirs_base[self._cut_idx]
+                    dir_y = self._cut_dirs_base[1]
                 else:
                     dir_y = np.array([0.0, 1.0, 0.0], np.float32)  # safe default
 
@@ -288,6 +327,7 @@ class DissectionNode(Node):
                 self._cutter_started = True
                 return
 
+
             if self._cutter_started:
                 st2 = self.psm2_cut.step()
                 if st2.done:
@@ -295,35 +335,21 @@ class DissectionNode(Node):
                     self._cut_idx += 1
                     if self._cut_idx >= self._cut_total:
                         self.get_logger().info("PSM2: all cut targets complete ✔")
-                        self.reveal.start()
-                        self._phase = "REVEAL_INIT"
 
+                        if self.replay and self._replay_count < self._replay_limit - 1:
+                            self._replay_count += 1
+                            self.get_logger().info(f"Replaying PSM2 sequence ({self._replay_count}/{self._replay_limit})")
+                            self._cut_idx = 0
+                            self._cutter_started = False
+                            self._phase = "PSM2"
+                        else:
+                            self.reveal.start()
+                            self._phase = "REVEAL_INIT"
+                            # self._phase = "DONE"
 
         elif self._phase == "REVEAL_INIT":
-
-            self._cut_targets_uv = self._get_live_cut_targets_uv()
-            self._last_cut_poly4_uv = self._poly4_from_targets(self._cut_targets_uv)
-
-            W, H = self.left.shape[1], self.left.shape[0]
-            endpoints = self._endpoints_from_points(self._cut_targets_uv, W, H)
-            if self.left is None:
-                self.get_logger().warn("REVEAL_INIT: no left image yet")
-                return
-
-            # endpoints = self._endpoints_from_points(self._cut_targets_uv, self.left.shape[1], self.left.shape[0])
             try:
-                first_rgb = cv2.cvtColor(self.left, cv2.COLOR_BGR2RGB)
-                self.reveal_trk.initialize(
-                    first_frame_rgb=first_rgb,
-                    mode="line_pairs",
-                    points=endpoints,
-                    n_pairs=100,
-                    width_factor=2.0,
-                )
-                self._reveal_ready  = True
-                self._reveal_active = True
-                self._reveal_t0 = self._now_s()
-                self.get_logger().info(f"REVEAL: initialized line_pairs with endpoints {endpoints}")
+                self._init_reveal_tracker_from_targets()
                 self._phase = "REVEAL_RUN"
             except Exception as e:
                 self.get_logger().warn(f"REVEAL_INIT failed: {e}")
@@ -340,11 +366,62 @@ class DissectionNode(Node):
 
 
         elif self._phase == "DONE":
-
+            self._replay_count = 0
+            if self.record_flag:
+                self._stop_recording()
             pass
 
 
 
+
+
+    def _init_reveal_tracker_from_targets(self):
+        """
+        Initialize reveal_trk using the current 3 live targets (_cut_targets_uv)
+        with either 'line_pairs' or 'roi' mode, based on self.reveal_mode.
+        """
+        if self.left is None:
+            raise RuntimeError("No left image yet")
+
+        # make sure we have fresh targets + a 4-pt poly for display/scoring
+        self._cut_targets_uv = self._get_live_cut_targets_uv()
+        self._last_cut_poly4_uv = self._poly4_from_targets(self._cut_targets_uv)
+
+        H, W = self.left.shape[:2]
+        first_rgb = cv2.cvtColor(self.left, cv2.COLOR_BGR2RGB)
+
+        mode = (self.reveal_mode or "line_pairs").lower()
+        if mode not in ("line_pairs", "roi"):
+            self.get_logger().warn(f"Unknown reveal_mode='{mode}', falling back to line_pairs")
+            mode = "line_pairs"
+
+        if mode == "line_pairs":
+            # two endpoints spanning the 3 targets (your current behavior)
+            endpoints = self._endpoints_from_points(self._cut_targets_uv, W, H)
+            kwargs = dict(self.reveal_presets["line_pairs"])
+            self.reveal_trk.initialize(
+                first_frame_rgb=first_rgb,
+                mode="line_pairs",
+                points=endpoints,
+                **kwargs
+            )
+            self.get_logger().info(f"REVEAL init: line_pairs endpoints={endpoints}, cfg={kwargs}")
+
+        else:  # ROI mode
+            # seed ROI with two endpoints; tracker builds a band around that line
+            endpoints = self._endpoints_from_points(self._cut_targets_uv, W, H, margin_px=30)
+            kwargs = dict(self.reveal_presets["roi"])
+            self.reveal_trk.initialize(
+                first_frame_rgb=first_rgb,
+                mode="roi",
+                points=endpoints,
+                **kwargs
+            )
+            self.get_logger().info(f"REVEAL init: roi endpoints={endpoints}, cfg={kwargs}")
+
+        self._reveal_ready  = True
+        self._reveal_active = True
+        self._reveal_t0 = self._now_s()
 
 
 
@@ -898,6 +975,57 @@ class DissectionNode(Node):
         else:
             dirs.append((1.0, 0.0))
         return dirs
+
+
+    def _ensure_dir(self, path: str):
+        os.makedirs(path, exist_ok=True)
+
+    def _next_episode_dir(self) -> str:
+        self._ensure_dir(self._data_root)
+        # find episode_XXXX dirs and pick the next index
+        max_idx = -1
+        for name in os.listdir(self._data_root):
+            p = os.path.join(self._data_root, name)
+            if os.path.isdir(p) and name.startswith("episode_") and len(name) == len("episode_0000"):
+                try:
+                    idx = int(name.split("_")[1])
+                    max_idx = max(max_idx, idx)
+                except Exception:
+                    pass
+        next_idx = max_idx + 1
+        ep = os.path.join(self._data_root, f"episode_{next_idx:04d}")
+        self._ensure_dir(ep)
+        # optional: make subfolder 'colors' like your other datasets
+        self._ensure_dir(os.path.join(ep, "colors"))
+        return ep
+
+    def _start_recording(self):
+        if self._recording:
+            return
+        self._episode_dir = self._next_episode_dir()
+        self._frame_idx = 1
+        self._recording = True
+        self.get_logger().info(f"[REC] Started episode at: {self._episode_dir}")
+
+    def _stop_recording(self):
+        if not self._recording:
+            return
+        self._recording = False
+        self.get_logger().info(f"[REC] Stopped. Saved {self._frame_idx-1} frames to {self._episode_dir}")
+        self._episode_dir = None
+
+    def _save_left_frame(self, img_bgr: np.ndarray):
+        """Save current left frame into episode/colors as a JPG."""
+        if not self._recording or self._episode_dir is None or img_bgr is None:
+            return
+        colors_dir = os.path.join(self._episode_dir, "colors")
+        # name like left_image_000001.jpg
+        fname = os.path.join(colors_dir, f"left_image_{self._frame_idx:06d}.jpg")
+        ok = cv2.imwrite(fname, img_bgr)
+        if ok:
+            self._frame_idx += 1
+        else:
+            self.get_logger().warn(f"[REC] Failed to write: {fname}")
 
 def main():
     rclpy.init()
